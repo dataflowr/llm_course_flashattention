@@ -217,6 +217,25 @@ def online_softmax_triton(x, BLOCK_1=16, BLOCK_2=16):
     return softmax_output
 
 
+def softmax_backward(grad_output, output):
+    sum_grad_output = torch.sum(grad_output * output, dim=-1, keepdim=True)
+    grad_input = output * (grad_output - sum_grad_output)
+    return grad_input
+
+
+class OnlineSoftmaxTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, BLOCK_1=16, BLOCK_2=16):
+        y= online_softmax_triton(x, BLOCK_1=BLOCK_1, BLOCK_2=BLOCK_2)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        y, = ctx.saved_tensors
+        return softmax_backward(grad_output, y), None, None
+
+
 if __name__ == "__main__":
     # Simple test
     x = torch.randn(1, 16, 32).cuda()
@@ -245,3 +264,28 @@ if __name__ == "__main__":
         .max()
         .item(),
     )
+
+    # Test backward pass
+    print("\n" + "=" * 50)
+    print("BACKWARD PASS TEST")
+    print("=" * 50)
+
+    # Create input with gradients
+    x_ref = torch.randn(2, 16, 32, device="cuda", requires_grad=True)
+    x_triton = x_ref.detach().clone().requires_grad_(True)
+
+    # Forward pass
+    y_ref = torch.softmax(x_ref, dim=-1)
+    y_triton = OnlineSoftmaxTriton.apply(x_triton, B, B)
+
+    # Create upstream gradient
+    grad_output = torch.randn_like(y_ref)
+
+    # Backward pass
+    y_ref.backward(grad_output)
+    y_triton.backward(grad_output)
+
+    # Compare gradients
+    grad_diff = torch.abs(x_ref.grad - x_triton.grad).max().item()
+    print(f"Max gradient difference: {grad_diff}")
+    print(f"Backward pass test: {'PASSED' if grad_diff < 1e-5 else 'FAILED'}")
