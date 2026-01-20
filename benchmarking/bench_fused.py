@@ -4,7 +4,7 @@ import sys
 # Add parent directory to path so we can import from sibling packages
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from online_softmax.online_softmax import softmax, online_softmax_triton
+from online_softmax.fused_softmax import softmax_mult, fused_softmax_triton
 from triton.compiler.errors import CompileTimeAssertionFailure
 
 import torch
@@ -21,7 +21,8 @@ nb_forward_passes = 100
 
 d1 = 2048
 d2 = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
-B = [8, 16, 32, 64, 128]
+d3 = 64  # Output dimension for V matrix
+B = [16, 32, 64, 128]  # Block sizes must be >= 16 for tl.dot
 
 
 
@@ -42,24 +43,25 @@ def time_loop(fn, iters):
     return times
 
 
-def _create_inputs(batch_size, d1, d2, device, dtype):
+def _create_inputs(batch_size, d1, d2, d3, device, dtype):
     x = torch.randn(batch_size, d1, d2, device=device, dtype=dtype)
-    return x
+    V = torch.randn(batch_size, d2, d3, device=device, dtype=dtype)
+    return x, V
 
-def _get_softmax(triton, BLOCK=16):
+def _get_fused_softmax(triton, BLOCK=16):
     if triton:
-        return lambda x: online_softmax_triton(x, BLOCK_1=BLOCK, BLOCK_2=BLOCK)
+        return lambda x, V: fused_softmax_triton(x, V, BLOCK_1=BLOCK, BLOCK_2=BLOCK)
     else:
-        return softmax
+        return softmax_mult
 
-def _warmup(x, fn, nb_warmup):
+def _warmup(x, V, fn, nb_warmup):
     for _ in range(nb_warmup):
-        y = fn(x)
+        y = fn(x, V)
     return y
 
-def _benchmark_forward(x, fn, n_iters):
+def _benchmark_forward(x, V, fn, n_iters):
     torch.cuda.reset_peak_memory_stats()
-    times = time_loop(lambda: fn(x), n_iters)
+    times = time_loop(lambda: fn(x, V), n_iters)
     fwd_peak = torch.cuda.max_memory_allocated()
 
     return {
@@ -68,27 +70,27 @@ def _benchmark_forward(x, fn, n_iters):
         "forward_peak_MiB": fwd_peak / 1024**2,
     }
 
-def run_config(batch_size, d1, d2, BLOCK, device, dtype, snapshot_name, triton=False):
-    config_str = f"bs={batch_size}_d1={d1}_d2={d2}_triton={triton}_BLOCK={BLOCK}"
+def run_config(batch_size, d1, d2, d3, BLOCK, device, dtype, snapshot_name, triton=False):
+    config_str = f"bs={batch_size}_d1={d1}_d2={d2}_d3={d3}_triton={triton}_BLOCK={BLOCK}"
 
     print(f"Running config: {config_str}")
-    x = _create_inputs(batch_size, d1, d2, device, dtype)
+    x, V = _create_inputs(batch_size, d1, d2, d3, device, dtype)
 
-    softmax_fn = _get_softmax(triton, BLOCK=BLOCK)
+    fused_softmax_fn = _get_fused_softmax(triton, BLOCK=BLOCK)
 
     # Warmup
-    _warmup(x, softmax_fn, nb_warmup)
+    _warmup(x, V, fused_softmax_fn, nb_warmup)
 
-    results = _benchmark_forward(x, softmax_fn, nb_forward_passes)
+    results = _benchmark_forward(x, V, fused_softmax_fn, nb_forward_passes)
 
 
-    return { "batch_size": batch_size, "d1": d1, "d2": d2, "triton": triton, "BLOCK": BLOCK, **results }
+    return { "batch_size": batch_size, "d1": d1, "d2": d2, "d3": d3, "triton": triton, "BLOCK": BLOCK, **results }
 
 def run_benchmark():
     # Build all configs: (d2_val, triton, BLOCK)
     configs = []
     for d2_val in d2:
-        configs.append((d2_val, False, None))  # Standard softmax
+        configs.append((d2_val, False, None))  # Standard softmax_mult
         for BLOCK in B:
             configs.append((d2_val, True, BLOCK))  # Triton variants
 
@@ -101,10 +103,10 @@ def run_benchmark():
 
         # Generate snapshot filename
         impl = f"triton_BLOCK{BLOCK}" if triton else "standard"
-        snapshot_name = f"outputs/snapshots/softmax_d2_{d2_val}_{impl}.pickle"
+        snapshot_name = f"outputs/snapshots/fused_softmax_d2_{d2_val}_{impl}.pickle"
 
         try:
-            res = run_config(batch_size, d1, d2_val, BLOCK, device, dtype, snapshot_name, triton=triton)
+            res = run_config(batch_size, d1, d2_val, d3, BLOCK, device, dtype, snapshot_name, triton=triton)
             results.append(res)
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -113,14 +115,14 @@ def run_benchmark():
             else:
                 raise
             results.append({
-                "batch_size": batch_size, "d1": d1, "d2": d2_val,
+                "batch_size": batch_size, "d1": d1, "d2": d2_val, "d3": d3,
                 "triton": triton, "BLOCK": BLOCK,
                 "forward_ms_mean": None, "forward_ms_std": None, "forward_peak_MiB": None,
             })
         except CompileTimeAssertionFailure:
             print(f"  Skipping: BLOCK={BLOCK} incompatible with d1={d1} or d2={d2_val}")
             results.append({
-                "batch_size": batch_size, "d1": d1, "d2": d2_val,
+                "batch_size": batch_size, "d1": d1, "d2": d2_val, "d3": d3,
                 "triton": triton, "BLOCK": BLOCK,
                 "forward_ms_mean": None, "forward_ms_std": None, "forward_peak_MiB": None,
             })
@@ -132,7 +134,7 @@ def run_benchmark():
     df["BLOCK"] = df["BLOCK"].astype("Int64")  # Nullable integer type
     print(df.to_string())
     # Save results
-    out_csv = "outputs/softmax_benchmark.csv"
+    out_csv = "outputs/fused_softmax_benchmark.csv"
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
     print(f"\nResults saved to {out_csv}")
