@@ -1,16 +1,14 @@
 name: flashattention
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
   - python>=3.10
-  - pytorch>=2.0
-  - pytorch-cuda>=11.8
   - numpy
   - pandas
   - pytest
   - pip
   - pip:
+    - torch --index-url https://download.pytorch.org/whl/cu124
+    - torchvision --index-url https://download.pytorch.org/whl/cu124
     - triton>=2.1.0
