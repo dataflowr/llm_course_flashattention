@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from online_softmax.fused_softmax import softmax_mult, fused_softmax_triton
 from triton.compiler.errors import CompileTimeAssertionFailure
+from triton.runtime.errors import OutOfResources
 
 import torch
 import math
@@ -121,6 +122,13 @@ def run_benchmark():
             })
         except CompileTimeAssertionFailure:
             print(f"  Skipping: BLOCK={BLOCK} incompatible with d1={d1} or d2={d2_val}")
+            results.append({
+                "batch_size": batch_size, "d1": d1, "d2": d2_val, "d3": d3,
+                "triton": triton, "BLOCK": BLOCK,
+                "forward_ms_mean": None, "forward_ms_std": None, "forward_peak_MiB": None,
+            })
+        except OutOfResources as e:
+            print(f"  Skipping: BLOCK={BLOCK} exceeds shared memory limit ({e})")
             results.append({
                 "batch_size": batch_size, "d1": d1, "d2": d2_val, "d3": d3,
                 "triton": triton, "BLOCK": BLOCK,
